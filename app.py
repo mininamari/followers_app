@@ -7,9 +7,8 @@ import io
 import os
 import re
 import secrets
-import shutil
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Iterable
 
@@ -20,6 +19,30 @@ import streamlit as st
 APP_TITLE = "Instagram followers calculator"
 DB_PATH = Path(os.getenv("FOLLOWERS_DB_PATH", "data/followers_team.db"))
 UPLOAD_DIR = Path(os.getenv("FOLLOWERS_UPLOAD_DIR", "data/uploads"))
+BACKUP_DIR = Path(os.getenv("FOLLOWERS_BACKUP_DIR", "backups"))
+BACKUP_RETENTION = int(os.getenv("FOLLOWERS_BACKUP_RETENTION", "8"))
+BACKUP_INTERVAL_DAYS = int(os.getenv("FOLLOWERS_BACKUP_INTERVAL_DAYS", "7"))
+
+ROLE_ADMIN = "admin"
+ROLE_MANAGER = "manager"
+ROLE_VIEWER = "viewer"
+ROLES = [ROLE_ADMIN, ROLE_MANAGER, ROLE_VIEWER]
+ROLE_LABELS = {
+    ROLE_ADMIN: "Admin",
+    ROLE_MANAGER: "Manager",
+    ROLE_VIEWER: "Viewer",
+}
+PERMISSIONS = {
+    ROLE_ADMIN: {
+        "view_dashboard", "view_reports", "export_reports", "upload_meta", "upload_pr",
+        "edit_reports", "view_history", "manage_users", "manage_backups",
+    },
+    ROLE_MANAGER: {
+        "view_dashboard", "view_reports", "export_reports", "upload_meta", "upload_pr",
+        "edit_reports", "view_history",
+    },
+    ROLE_VIEWER: {"view_dashboard", "view_reports", "export_reports", "view_history"},
+}
 
 META_ID_COL = "ID публикации"
 META_FOLLOWERS_COL = "Подписки"
@@ -68,9 +91,30 @@ def now_utc() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
+def parse_utc(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", ""))
+    except ValueError:
+        return None
+
+
+def has_permission(user: Optional[dict], permission: str) -> bool:
+    if not user:
+        return False
+    return permission in PERMISSIONS.get(user.get("role", ""), set())
+
+
+def require_permission(user: Optional[dict], permission: str) -> None:
+    if not has_permission(user, permission):
+        raise PermissionError("У вас нет прав для этого действия.")
+
+
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
@@ -79,12 +123,13 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('admin','user')),
+                role TEXT NOT NULL CHECK(role IN ('admin','manager','viewer')),
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             )
             """
         )
+        migrate_user_roles(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS uploads (
@@ -178,12 +223,21 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
         ensure_schema_columns(conn)
         purge_non_novakid_data(conn)
         sanitize_stored_meta_uploads(conn)
         backfill_stored_meta_reach(conn)
         ensure_default_admin(conn)
+    maybe_create_weekly_backup()
 
 
 def hash_password(password: str) -> str:
@@ -208,11 +262,59 @@ def verify_password(password: str, stored: str) -> bool:
 def ensure_default_admin(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
+        username = os.getenv("FOLLOWERS_ADMIN_USERNAME", "").strip()
+        password = os.getenv("FOLLOWERS_ADMIN_PASSWORD", "")
+        if not username or not password:
+            return
+        if len(password) < 8:
+            raise ValueError("FOLLOWERS_ADMIN_PASSWORD must be at least 8 characters long.")
         conn.execute(
             "INSERT INTO users(username,password_hash,role,is_active,created_at) VALUES(?,?,?,?,?)",
-            ("admin", hash_password("admin123"), "admin", 1, now_utc()),
+            (username, hash_password(password), ROLE_ADMIN, 1, now_utc()),
         )
         conn.commit()
+
+
+def migrate_user_roles(conn: sqlite3.Connection) -> None:
+    table_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    if not table_sql:
+        return
+
+    sql = table_sql[0] or ""
+    needs_rebuild = "'user'" in sql or '"user"' in sql
+    roles = {row[0] for row in conn.execute("SELECT DISTINCT role FROM users")}
+    if not needs_rebuild and roles.issubset(set(ROLES)):
+        return
+
+    conn.execute("ALTER TABLE users RENAME TO users_legacy")
+    conn.execute(
+        """
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin','manager','viewer')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    legacy_rows = conn.execute(
+        "SELECT id, username, password_hash, role, is_active, created_at FROM users_legacy"
+    ).fetchall()
+    for user_id, username, password_hash, role, is_active, created_at in legacy_rows:
+        migrated_role = ROLE_ADMIN if role == "admin" else ROLE_MANAGER
+        conn.execute(
+            """
+            INSERT INTO users(id, username, password_hash, role, is_active, created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (user_id, username, password_hash, migrated_role, is_active, created_at),
+        )
+    conn.execute("DROP TABLE users_legacy")
+    conn.commit()
 
 
 def ensure_schema_columns(conn: sqlite3.Connection) -> None:
@@ -350,6 +452,83 @@ def authenticate(username: str, password: str) -> Optional[dict]:
     if user and user["is_active"] and verify_password(password, user["password_hash"]):
         return user
     return None
+
+
+def get_setting(key: str) -> Optional[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+
+def set_setting(key: str, value: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO system_settings(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
+def list_backups() -> list[dict]:
+    if not BACKUP_DIR.exists():
+        return []
+    backups = []
+    for path in sorted(BACKUP_DIR.glob("followers_team_*.db"), reverse=True):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        backups.append(
+            {
+                "name": path.name,
+                "path": path,
+                "created_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat(timespec="seconds") + "Z",
+                "size_bytes": stat.st_size,
+            }
+        )
+    return backups
+
+
+def prune_old_backups() -> None:
+    backups = list_backups()
+    for backup in backups[BACKUP_RETENTION:]:
+        try:
+            backup["path"].unlink()
+        except OSError:
+            continue
+
+
+def create_backup(created_by: str = "system") -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    target = BACKUP_DIR / f"followers_team_{timestamp}.db"
+    temp_target = target.with_suffix(".tmp")
+
+    with sqlite3.connect(DB_PATH) as source, sqlite3.connect(temp_target) as destination:
+        source.backup(destination, pages=100, sleep=0.05)
+    temp_target.replace(target)
+    prune_old_backups()
+    set_setting("last_weekly_backup_at", now_utc())
+    set_setting("last_backup_created_by", created_by)
+    return target
+
+
+def create_manual_backup(user: dict) -> Path:
+    require_permission(user, "manage_backups")
+    return create_backup(user["username"])
+
+
+def maybe_create_weekly_backup() -> None:
+    last_backup_at = parse_utc(get_setting("last_weekly_backup_at"))
+    if last_backup_at and datetime.utcnow() - last_backup_at < timedelta(days=BACKUP_INTERVAL_DAYS):
+        return
+    try:
+        create_backup("system")
+    except Exception:
+        # Backup failures should not prevent users from opening the app.
+        return
 
 
 # -------------------- CSV helpers --------------------
@@ -564,7 +743,8 @@ def recalc_final(account: str, period_start: str, period_end: str) -> None:
         conn.commit()
 
 
-def save_follower_overrides(rows: pd.DataFrame, username: str) -> int:
+def save_follower_overrides(rows: pd.DataFrame, user: dict) -> int:
+    require_permission(user, "edit_reports")
     selected = rows[rows["Изменить"] == True].copy()  # noqa: E712
     if selected.empty:
         raise ValueError("Отметьте строки, для которых нужно сохранить ручное значение.")
@@ -599,7 +779,7 @@ def save_follower_overrides(rows: pd.DataFrame, username: str) -> int:
                         updated_by=excluded.updated_by,
                         updated_at=excluded.updated_at
                     """,
-                    (*key, manual_value, username, updated_at),
+                    (*key, manual_value, user["username"], updated_at),
                 )
             affected_periods.add(key[:3])
         conn.commit()
@@ -618,7 +798,8 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 # -------------------- Import logic --------------------
 
-def import_meta(uploaded_file, username: str, manual_start: Optional[date], manual_end: Optional[date]) -> tuple[int, list[str]]:
+def import_meta(uploaded_file, user: dict, manual_start: Optional[date], manual_end: Optional[date]) -> tuple[int, list[str]]:
+    require_permission(user, "upload_meta")
     df = read_csv_any(uploaded_file)
     df, used_aliases = normalize_meta_columns(df)
     validate_columns(df, REQUIRED_META, "Meta Business Suite")
@@ -684,7 +865,7 @@ def import_meta(uploaded_file, username: str, manual_start: Optional[date], manu
         rows.append((
             r[META_ACCOUNT_USERNAME_COL], r.get(META_ACCOUNT_NAME_COL, ""), period_start, period_end, month, publication_date,
             r[META_ID_COL], r.get(META_LINK_COL, ""), int(r[META_REACH_COL]), int(r[META_FOLLOWERS_COL]), uploaded_file.name,
-            username, uploaded_at,
+            user["username"], uploaded_at,
         ))
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -710,7 +891,7 @@ def import_meta(uploaded_file, username: str, manual_start: Optional[date], manu
         )
         conn.execute(
             "INSERT INTO uploads(file_type,account,period_start,period_end,filename,stored_path,uploaded_by,uploaded_at,rows_saved,warnings) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            ("meta", None, period_start, period_end, uploaded_file.name, stored_path, username, uploaded_at, len(rows), "\n".join(warnings)),
+            ("meta", None, period_start, period_end, uploaded_file.name, stored_path, user["username"], uploaded_at, len(rows), "\n".join(warnings)),
         )
         conn.commit()
 
@@ -719,7 +900,8 @@ def import_meta(uploaded_file, username: str, manual_start: Optional[date], manu
     return len(rows), warnings
 
 
-def import_pr(uploaded_file, username: str, account: str, auto_detect_accounts: bool = False) -> tuple[int, list[str]]:
+def import_pr(uploaded_file, user: dict, account: str, auto_detect_accounts: bool = False) -> tuple[int, list[str]]:
+    require_permission(user, "upload_pr")
     if not auto_detect_accounts and not account.strip():
         raise ValueError("Для PR-файла нужно выбрать аккаунт, например novakid_israel.")
     account = account.strip()
@@ -794,7 +976,7 @@ def import_pr(uploaded_file, username: str, account: str, auto_detect_accounts: 
     for _, r in grouped.iterrows():
         rows.append((
             r["account"], period_start, period_end, month, r["publication_id"], int(r[PR_FOLLOWERS_COL]),
-            float(r[PR_SPEND_COL]), uploaded_file.name, username, uploaded_at,
+            float(r[PR_SPEND_COL]), uploaded_file.name, user["username"], uploaded_at,
         ))
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -824,7 +1006,7 @@ def import_pr(uploaded_file, username: str, account: str, auto_detect_accounts: 
                 period_end,
                 uploaded_file.name,
                 stored_path,
-                username,
+                user["username"],
                 uploaded_at,
                 len(rows),
                 "\n".join(warnings),
@@ -1001,8 +1183,8 @@ def login_screen() -> None:
         )
         with st.form("login"):
             st.markdown("### Вход в командный кабинет")
-            username = st.text_input("Логин", placeholder="admin")
-            password = st.text_input("Пароль", type="password", placeholder="••••••••")
+            username = st.text_input("Логин")
+            password = st.text_input("Пароль", type="password")
             submitted = st.form_submit_button("Войти", type="primary", use_container_width=True)
         if submitted:
             user = authenticate(username, password)
@@ -1011,7 +1193,8 @@ def login_screen() -> None:
                 st.rerun()
             else:
                 st.error("Неверный логин или пароль.")
-        st.info("Первый вход: login `admin`, password `admin123`. После входа создайте пользователей и смените пароль.")
+        if db_df("SELECT COUNT(*) AS user_count FROM users")["user_count"].iloc[0] == 0:
+            st.warning("Пользователи еще не созданы. Администратор первого запуска задается через переменные окружения.")
 
 
 def require_login() -> dict:
@@ -1027,9 +1210,23 @@ def sidebar(user: dict) -> str:
         st.caption("Social Reports")
         st.divider()
         st.write(f"**{user['username']}**")
-        st.caption(f"role: {user['role']}")
-        pages = ["Dashboard", "Upload Meta", "Upload PR", "Reports", "Upload history"]
-        pages.append("Users" if user["role"] == "admin" else "Profile")
+        st.caption(f"role: {ROLE_LABELS.get(user['role'], user['role'])}")
+        pages = []
+        if has_permission(user, "view_dashboard"):
+            pages.append("Dashboard")
+        if has_permission(user, "upload_meta"):
+            pages.append("Upload Meta")
+        if has_permission(user, "upload_pr"):
+            pages.append("Upload PR")
+        if has_permission(user, "view_reports"):
+            pages.append("Reports")
+        if has_permission(user, "view_history"):
+            pages.append("Upload history")
+        if has_permission(user, "manage_users"):
+            pages.append("Users")
+        if has_permission(user, "manage_backups"):
+            pages.append("Backups")
+        pages.append("Profile")
         page = st.radio("Navigation", pages, label_visibility="collapsed")
         st.divider()
         if st.button("Log out", use_container_width=True):
@@ -1153,6 +1350,10 @@ def shared_results_filters(df: pd.DataFrame) -> tuple[list[str], Optional[str], 
 
 
 def page_dashboard() -> None:
+    user = st.session_state.get("user")
+    if not has_permission(user, "view_dashboard"):
+        st.error("У вас нет прав для просмотра Dashboard.")
+        return
     hero(
         "Dashboard",
         "Обзор подписчиков, затрат и CPF по всем регионам Novakid. Используйте фильтры, чтобы смотреть отдельный аккаунт или месяц.",
@@ -1228,6 +1429,9 @@ def page_dashboard() -> None:
 
 
 def page_upload_meta(user: dict) -> None:
+    if not has_permission(user, "upload_meta"):
+        st.error("У вас нет прав для загрузки Meta CSV.")
+        return
     hero(
         "Upload Meta",
         "Загрузите CSV из Meta Business Suite. Русские и английские выгрузки распределяются по аккаунтам через username.",
@@ -1250,7 +1454,7 @@ def page_upload_meta(user: dict) -> None:
             st.error("Загрузите CSV.")
         else:
             try:
-                rows, warnings = import_meta(meta_file, user["username"], manual_start, manual_end)
+                rows, warnings = import_meta(meta_file, user, manual_start, manual_end)
                 st.success(f"Meta сохранена. Строк: {rows}. Отчет пересчитан автоматически.")
                 for w in warnings:
                     st.warning(w)
@@ -1259,6 +1463,9 @@ def page_upload_meta(user: dict) -> None:
 
 
 def page_upload_pr(user: dict) -> None:
+    if not has_permission(user, "upload_pr"):
+        st.error("У вас нет прав для загрузки PR CSV.")
+        return
     hero(
         "Upload PR",
         "Таргетолог загружает CSV из рекламного кабинета. Система распределит общий PR-файл по аккаунтам через ID публикации из Meta.",
@@ -1285,7 +1492,7 @@ def page_upload_pr(user: dict) -> None:
             st.error("Загрузите CSV.")
         else:
             try:
-                rows, warnings = import_pr(pr_file, user["username"], account, auto_detect)
+                rows, warnings = import_pr(pr_file, user, account, auto_detect)
                 target = "по аккаунтам из Meta" if auto_detect else f"для {account}"
                 st.success(f"PR сохранен {target}. Строк: {rows}. Отчет пересчитан автоматически.")
                 for w in warnings:
@@ -1308,6 +1515,9 @@ def filtered_results_ui() -> pd.DataFrame:
 
 
 def page_report(user: dict) -> None:
+    if not has_permission(user, "view_reports"):
+        st.error("У вас нет прав для просмотра отчетов.")
+        return
     hero(
         "Reports",
         "Финальная таблица после матчинга Meta + PR. Для выбранных строк можно вручную уточнить подписчиков из рекламного кабинета.",
@@ -1328,89 +1538,92 @@ def page_report(user: dict) -> None:
     c3.metric("Spend", f"${total_spend:,.2f}")
     c4.metric("CPF", "—" if cpf is None else f"${cpf:,.2f}")
 
-    st.markdown("### Ручное уточнение подписчиков из рекламного кабинета")
-    st.caption(
-        "Сначала отметьте нужные строки. Они появятся в отдельном блоке сверху, где можно указать фактическое число подписчиков PR. "
-        "Строки с предупреждением выбраны автоматически. "
-        "Чтобы вернуть значение из CSV, очистите ручное поле и сохраните строку."
-    )
-    selection_cols = [
-        "Выбрать", "account", "publication_date", "publication_id", "publication_link",
-        "post_reach", "meta_followers", "pr_followers", "final_followers", "warning", "period_start", "period_end",
-    ]
-    selection_data = f.copy()
-    selection_data.insert(0, "Выбрать", selection_data["warning"].fillna("") != "")
-    selected_rows_container = st.container()
+    if has_permission(user, "edit_reports"):
+        st.markdown("### Ручное уточнение подписчиков из рекламного кабинета")
+        st.caption(
+            "Сначала отметьте нужные строки. Они появятся в отдельном блоке сверху, где можно указать фактическое число подписчиков PR. "
+            "Строки с предупреждением выбраны автоматически. "
+            "Чтобы вернуть значение из CSV, очистите ручное поле и сохраните строку."
+        )
+        selection_cols = [
+            "Выбрать", "account", "publication_date", "publication_id", "publication_link",
+            "post_reach", "meta_followers", "pr_followers", "final_followers", "warning", "period_start", "period_end",
+        ]
+        selection_data = f.copy()
+        selection_data.insert(0, "Выбрать", selection_data["warning"].fillna("") != "")
+        selected_rows_container = st.container()
 
-    st.markdown("#### Все строки")
-    selected_rows = st.data_editor(
-        selection_data[selection_cols],
-        use_container_width=True,
-        hide_index=True,
-        disabled=[c for c in selection_cols if c != "Выбрать"],
-        column_config={
-            "Выбрать": st.column_config.CheckboxColumn("Выбрать", help="Добавить строку в блок ручного ввода"),
-            "account": "Аккаунт",
-            "publication_date": "Дата публикации",
-            "publication_id": "ID публикации",
-            "publication_link": st.column_config.LinkColumn("Ссылка"),
-            "post_reach": "Охват поста",
-            "meta_followers": "Подписчики Meta",
-            "pr_followers": "PR для расчёта",
-            "final_followers": "Итог подписчиков",
-            "warning": "Комментарий",
-            "period_start": None,
-            "period_end": None,
-        },
-        key="followers_override_selector",
-    )
-    selected_rows = selected_rows[selected_rows["Выбрать"] == True].copy()  # noqa: E712
+        st.markdown("#### Все строки")
+        selected_rows = st.data_editor(
+            selection_data[selection_cols],
+            use_container_width=True,
+            hide_index=True,
+            disabled=[c for c in selection_cols if c != "Выбрать"],
+            column_config={
+                "Выбрать": st.column_config.CheckboxColumn("Выбрать", help="Добавить строку в блок ручного ввода"),
+                "account": "Аккаунт",
+                "publication_date": "Дата публикации",
+                "publication_id": "ID публикации",
+                "publication_link": st.column_config.LinkColumn("Ссылка"),
+                "post_reach": "Охват поста",
+                "meta_followers": "Подписчики Meta",
+                "pr_followers": "PR для расчёта",
+                "final_followers": "Итог подписчиков",
+                "warning": "Комментарий",
+                "period_start": None,
+                "period_end": None,
+            },
+            key="followers_override_selector",
+        )
+        selected_rows = selected_rows[selected_rows["Выбрать"] == True].copy()  # noqa: E712
 
-    with selected_rows_container:
-        st.markdown("#### Выбранные строки для ручного ввода")
-        if selected_rows.empty:
-            st.info("Отметьте строки в списке ниже. Строки с предупреждением отмечаются автоматически.")
-        else:
-            selected_keys = ["account", "period_start", "period_end", "publication_id"]
-            selected_source = f.merge(selected_rows[selected_keys], on=selected_keys, how="inner")
-            selected_editor_cols = [
-                "account", "publication_date", "publication_id", "publication_link",
-                "post_reach", "meta_followers", "imported_pr_followers", "manual_pr_followers", "pr_followers",
-                "final_followers", "warning", "period_start", "period_end",
-            ]
-            edited = st.data_editor(
-                selected_source[selected_editor_cols],
-                use_container_width=True,
-                hide_index=True,
-                disabled=[c for c in selected_editor_cols if c != "manual_pr_followers"],
-                column_config={
-                    "account": "Аккаунт",
-                    "publication_date": "Дата публикации",
-                    "publication_id": "ID публикации",
-                    "publication_link": st.column_config.LinkColumn("Ссылка"),
-                    "post_reach": "Охват поста",
-                    "meta_followers": "Подписчики Meta",
-                    "imported_pr_followers": "PR из CSV",
-                    "manual_pr_followers": st.column_config.NumberColumn(
-                        "PR вручную", min_value=0, step=1, format="%d",
-                        help="Пусто — использовать значение из CSV",
-                    ),
-                    "pr_followers": "PR для расчёта",
-                    "final_followers": "Итог подписчиков",
-                    "warning": "Комментарий",
-                    "period_start": None,
-                    "period_end": None,
-                },
-                key="followers_override_editor",
-            )
-            if st.button("Сохранить ручные значения и пересчитать", type="primary", use_container_width=True):
-                try:
-                    edited.insert(0, "Изменить", True)
-                    changed = save_follower_overrides(edited, user["username"])
-                    st.success(f"Сохранено строк: {changed}. Отчет пересчитан.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
+        with selected_rows_container:
+            st.markdown("#### Выбранные строки для ручного ввода")
+            if selected_rows.empty:
+                st.info("Отметьте строки в списке ниже. Строки с предупреждением отмечаются автоматически.")
+            else:
+                selected_keys = ["account", "period_start", "period_end", "publication_id"]
+                selected_source = f.merge(selected_rows[selected_keys], on=selected_keys, how="inner")
+                selected_editor_cols = [
+                    "account", "publication_date", "publication_id", "publication_link",
+                    "post_reach", "meta_followers", "imported_pr_followers", "manual_pr_followers", "pr_followers",
+                    "final_followers", "warning", "period_start", "period_end",
+                ]
+                edited = st.data_editor(
+                    selected_source[selected_editor_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[c for c in selected_editor_cols if c != "manual_pr_followers"],
+                    column_config={
+                        "account": "Аккаунт",
+                        "publication_date": "Дата публикации",
+                        "publication_id": "ID публикации",
+                        "publication_link": st.column_config.LinkColumn("Ссылка"),
+                        "post_reach": "Охват поста",
+                        "meta_followers": "Подписчики Meta",
+                        "imported_pr_followers": "PR из CSV",
+                        "manual_pr_followers": st.column_config.NumberColumn(
+                            "PR вручную", min_value=0, step=1, format="%d",
+                            help="Пусто — использовать значение из CSV",
+                        ),
+                        "pr_followers": "PR для расчёта",
+                        "final_followers": "Итог подписчиков",
+                        "warning": "Комментарий",
+                        "period_start": None,
+                        "period_end": None,
+                    },
+                    key="followers_override_editor",
+                )
+                if st.button("Сохранить ручные значения и пересчитать", type="primary", use_container_width=True):
+                    try:
+                        edited.insert(0, "Изменить", True)
+                        changed = save_follower_overrides(edited, user)
+                        st.success(f"Сохранено строк: {changed}. Отчет пересчитан.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+    else:
+        st.info("Режим просмотра: ваша роль не позволяет менять ручные значения.")
 
     st.markdown("### Финальный отчет")
     display_cols = [
@@ -1459,6 +1672,10 @@ def page_report(user: dict) -> None:
 
 
 def page_upload_history() -> None:
+    user = st.session_state.get("user")
+    if not has_permission(user, "view_history"):
+        st.error("У вас нет прав для просмотра истории загрузок.")
+        return
     hero("Upload history", "Кто, когда и какие файлы загружал. Это помогает проверять актуальность отчетов.", ["Audit", "Files", "Rows saved"])
     df = db_df("SELECT file_type, account, period_start, period_end, filename, uploaded_by, uploaded_at, rows_saved, warnings FROM uploads ORDER BY uploaded_at DESC")
     if df.empty:
@@ -1467,39 +1684,45 @@ def page_upload_history() -> None:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def page_profile(user: dict) -> None:
+    hero("Profile", "Смена личного пароля пользователя.", ["Security"])
+    with st.form("change_my_password"):
+        old = st.text_input("Старый пароль", type="password")
+        new = st.text_input("Новый пароль", type="password")
+        ok = st.form_submit_button("Сменить пароль", use_container_width=True)
+    if ok:
+        current = get_user(user["username"])
+        if current and verify_password(old, current["password_hash"]) and len(new) >= 8:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE users SET password_hash=? WHERE username=?", (hash_password(new), user["username"]))
+                conn.commit()
+            st.success("Пароль обновлен.")
+        else:
+            st.error("Проверьте старый пароль. Новый пароль должен быть минимум 8 символов.")
+
+
 def page_users(user: dict) -> None:
-    if user["role"] != "admin":
-        hero("Profile", "Смена личного пароля пользователя.", ["Security"])
-        with st.form("change_my_password"):
-            old = st.text_input("Старый пароль", type="password")
-            new = st.text_input("Новый пароль", type="password")
-            ok = st.form_submit_button("Сменить пароль", use_container_width=True)
-        if ok:
-            current = get_user(user["username"])
-            if current and verify_password(old, current["password_hash"]) and len(new) >= 8:
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.execute("UPDATE users SET password_hash=? WHERE username=?", (hash_password(new), user["username"]))
-                    conn.commit()
-                st.success("Пароль обновлен.")
-            else:
-                st.error("Проверьте старый пароль. Новый пароль должен быть минимум 8 символов.")
+    if not has_permission(user, "manage_users"):
+        st.error("У вас нет прав для управления пользователями.")
         return
 
-    hero("Users", "Админка для создания пользователей и сброса паролей.", ["Admin", "Roles", "Passwords"])
+    hero("Users", "Админка для создания, изменения и удаления пользователей.", ["Admin", "Roles", "Passwords"])
     df = db_df("SELECT username, role, is_active, created_at FROM users ORDER BY username")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         st.subheader("Создать пользователя")
         with st.form("create_user"):
             username = st.text_input("Логин нового пользователя")
             password = st.text_input("Пароль", type="password")
-            role = st.selectbox("Роль", ["user", "admin"])
+            role = st.selectbox("Роль", ROLES, format_func=lambda value: ROLE_LABELS[value])
             submitted = st.form_submit_button("Создать", use_container_width=True)
         if submitted:
             if not username.strip() or len(password) < 8:
                 st.error("Укажите логин и пароль минимум 8 символов.")
+            elif role not in ROLES:
+                st.error("Выберите корректную роль.")
             else:
                 try:
                     with sqlite3.connect(DB_PATH) as conn:
@@ -1513,10 +1736,35 @@ def page_users(user: dict) -> None:
                 except sqlite3.IntegrityError:
                     st.error("Такой пользователь уже есть.")
     with c2:
-        st.subheader("Сменить пароль")
+        st.subheader("Редактировать пользователя")
+        users = db_df("SELECT username FROM users ORDER BY username")["username"].tolist()
+        with st.form("edit_user"):
+            target = st.selectbox("Пользователь", users)
+            current = get_user(target) if target else None
+            current_role = current["role"] if current else ROLE_VIEWER
+            current_active = bool(current["is_active"]) if current else True
+            role = st.selectbox(
+                "Роль",
+                ROLES,
+                index=ROLES.index(current_role) if current_role in ROLES else 0,
+                format_func=lambda value: ROLE_LABELS[value],
+            )
+            is_active = st.checkbox("Активен", value=current_active)
+            ok = st.form_submit_button("Сохранить", use_container_width=True)
+        if ok:
+            if target == user["username"] and (role != user["role"] or not is_active):
+                st.error("Нельзя изменить собственную роль или отключить собственную учетную запись.")
+            else:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE users SET role=?, is_active=? WHERE username=?", (role, int(is_active), target))
+                    conn.commit()
+                st.success("Пользователь обновлен.")
+                st.rerun()
+    with c3:
+        st.subheader("Пароль и удаление")
         users = db_df("SELECT username FROM users ORDER BY username")["username"].tolist()
         with st.form("reset_password"):
-            target = st.selectbox("Пользователь", users)
+            target = st.selectbox("Пользователь", users, key="password_target")
             new_pass = st.text_input("Новый пароль", type="password")
             ok = st.form_submit_button("Обновить пароль", use_container_width=True)
         if ok:
@@ -1527,6 +1775,73 @@ def page_users(user: dict) -> None:
                     conn.execute("UPDATE users SET password_hash=? WHERE username=?", (hash_password(new_pass), target))
                     conn.commit()
                 st.success("Пароль обновлен.")
+
+        with st.form("delete_user"):
+            target = st.selectbox("Пользователь", users, key="delete_target")
+            confirm = st.checkbox("Подтверждаю удаление пользователя")
+            delete_ok = st.form_submit_button("Удалить пользователя", use_container_width=True)
+        if delete_ok:
+            if target == user["username"]:
+                st.error("Нельзя удалить собственную учетную запись.")
+            elif not confirm:
+                st.error("Подтвердите удаление.")
+            else:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM users WHERE username=?", (target,))
+                    conn.commit()
+                st.success("Пользователь удален.")
+                st.rerun()
+
+
+def page_backups(user: dict) -> None:
+    if not has_permission(user, "manage_backups"):
+        st.error("У вас нет прав для управления резервными копиями.")
+        return
+
+    hero(
+        "Backups",
+        "Резервные копии SQLite создаются автоматически раз в неделю. Администратор может создать и скачать копию вручную.",
+        ["Weekly", f"Keep last {BACKUP_RETENTION}", "SQLite snapshot"],
+    )
+    last_backup = get_setting("last_weekly_backup_at")
+    st.caption(f"Backup directory: {BACKUP_DIR}")
+    st.caption(f"Last scheduled/manual backup: {last_backup or 'never'}")
+
+    if st.button("Create Backup", type="primary", use_container_width=True):
+        try:
+            backup_path = create_manual_backup(user)
+            st.success(f"Backup created: {backup_path.name}")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Backup failed: {exc}")
+
+    backups = list_backups()
+    if not backups:
+        st.info("Резервных копий пока нет.")
+        return
+
+    table = pd.DataFrame(
+        [
+            {
+                "file": backup["name"],
+                "created_at": backup["created_at"],
+                "size_mb": round(backup["size_bytes"] / 1024 / 1024, 2),
+            }
+            for backup in backups
+        ]
+    )
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    st.markdown("### Download Backup")
+    selected_name = st.selectbox("Backup file", [backup["name"] for backup in backups])
+    selected = next(backup for backup in backups if backup["name"] == selected_name)
+    st.download_button(
+        "Download Backup",
+        data=selected["path"].read_bytes(),
+        file_name=selected["name"],
+        mime="application/octet-stream",
+        use_container_width=True,
+    )
 
 
 def main() -> None:
@@ -1545,8 +1860,14 @@ def main() -> None:
         page_report(user)
     elif page == "Upload history":
         page_upload_history()
-    else:
+    elif page == "Users":
         page_users(user)
+    elif page == "Backups":
+        page_backups(user)
+    elif page == "Profile":
+        page_profile(user)
+    else:
+        page_dashboard()
 
 
 if __name__ == "__main__":
