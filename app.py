@@ -1243,30 +1243,45 @@ def set_period_picker_year(year: str) -> None:
     st.session_state["period_picker_year"] = year
 
 
-def select_period(period: Optional[str]) -> None:
-    st.session_state["filter_period"] = period
-    if period:
-        st.session_state["period_picker_year"] = period[:4]
+def toggle_period(period: str) -> None:
+    selected_periods = list(st.session_state.get("filter_periods", []))
+    if period in selected_periods:
+        selected_periods.remove(period)
+    else:
+        selected_periods.append(period)
+    st.session_state["filter_periods"] = sorted(selected_periods, reverse=True)
+    st.session_state["period_picker_year"] = period[:4]
 
 
-def apply_date_filter(df: pd.DataFrame, selected_period: Optional[str]) -> pd.DataFrame:
-    if not selected_period:
+def clear_periods() -> None:
+    st.session_state["filter_periods"] = []
+
+
+def apply_date_filter(df: pd.DataFrame, selected_periods: list[str]) -> pd.DataFrame:
+    if not selected_periods:
         return df.iloc[0:0]
-    return df[df["month"] == selected_period]
+    return df[df["month"].isin(selected_periods)]
 
 
-def period_picker(container, available_periods: list[str]) -> Optional[str]:
+def period_picker(container, available_periods: list[str]) -> list[str]:
     years = sorted({period[:4] for period in available_periods})
-    selected_period = st.session_state["filter_period"]
-    if "period_picker_year" not in st.session_state or st.session_state["period_picker_year"] not in years:
-        st.session_state["period_picker_year"] = selected_period[:4] if selected_period else years[-1]
+    selected_periods = st.session_state["filter_periods"]
+    if not years:
+        container.button("Periods: Choose periods", disabled=True, use_container_width=True)
+        return []
 
-    selected_label = (
-        f"{MONTH_NAMES[selected_period[5:7]]} {selected_period[:4]}"
-        if selected_period
-        else "Choose period"
-    )
-    with container.popover(f"Period: {selected_label}", use_container_width=True):
+    if "period_picker_year" not in st.session_state or st.session_state["period_picker_year"] not in years:
+        st.session_state["period_picker_year"] = selected_periods[0][:4] if selected_periods else years[-1]
+
+    if len(selected_periods) == 1:
+        selected_period = selected_periods[0]
+        selected_label = f"{MONTH_NAMES[selected_period[5:7]]} {selected_period[:4]}"
+    elif selected_periods:
+        selected_label = f"{len(selected_periods)} periods"
+    else:
+        selected_label = "Choose periods"
+
+    with container.popover(f"Periods: {selected_label}", use_container_width=True):
         picker_year = st.session_state["period_picker_year"]
         year_index = years.index(picker_year)
         prev_col, year_col, next_col = st.columns([1, 2, 1])
@@ -1292,41 +1307,46 @@ def period_picker(container, available_periods: list[str]) -> Optional[str]:
         for index, (month_number, month_name) in enumerate(MONTH_NAMES.items()):
             period = f"{picker_year}-{month_number}"
             month_columns[index % 3].button(
-                f"✓ {month_name}" if period == selected_period else month_name,
+                f"✓ {month_name}" if period in selected_periods else month_name,
                 key=f"period_{period}",
                 disabled=period not in available_periods,
-                on_click=select_period,
+                on_click=toggle_period,
                 args=(period,),
                 use_container_width=True,
             )
         st.button(
-            "Clear period",
+            "Clear periods",
             key="clear_period",
-            disabled=selected_period is None,
-            on_click=select_period,
-            args=(None,),
+            disabled=not selected_periods,
+            on_click=clear_periods,
             use_container_width=True,
         )
-    return st.session_state["filter_period"]
+    return st.session_state["filter_periods"]
 
 
-def shared_results_filters(df: pd.DataFrame) -> tuple[list[str], Optional[str], bool]:
+def shared_results_filters(df: pd.DataFrame) -> tuple[list[str], list[str], bool]:
     accounts = sorted(df["account"].dropna().unique().tolist())
     available_periods = sorted(df["month"].dropna().astype(str).unique().tolist(), reverse=True)
     defaults = {
         "filter_accounts": [],
-        "filter_period": None,
+        "filter_periods": [],
         "filter_warnings": False,
     }
     for key, default in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = default
 
+    legacy_period = st.session_state.pop("filter_period", None)
+    if legacy_period:
+        if not st.session_state["filter_periods"]:
+            st.session_state["filter_periods"] = [legacy_period]
+
     st.session_state["filter_accounts"] = [
         account for account in st.session_state["filter_accounts"] if account in accounts
     ]
-    if st.session_state["filter_period"] not in available_periods:
-        st.session_state["filter_period"] = None
+    st.session_state["filter_periods"] = [
+        period for period in st.session_state["filter_periods"] if period in available_periods
+    ]
 
     st.session_state["_filter_accounts"] = st.session_state["filter_accounts"]
     st.session_state["_filter_warnings"] = st.session_state["filter_warnings"]
@@ -1339,14 +1359,14 @@ def shared_results_filters(df: pd.DataFrame) -> tuple[list[str], Optional[str], 
         on_change=remember_shared_filter,
         args=("_filter_accounts", "filter_accounts"),
     )
-    selected_period = period_picker(c2, available_periods)
+    selected_periods = period_picker(c2, available_periods)
     only_warnings = c3.checkbox(
         "Only warnings",
         key="_filter_warnings",
         on_change=remember_shared_filter,
         args=("_filter_warnings", "filter_warnings"),
     )
-    return selected_accounts, selected_period, only_warnings
+    return selected_accounts, selected_periods, only_warnings
 
 
 def page_dashboard() -> None:
@@ -1356,7 +1376,7 @@ def page_dashboard() -> None:
         return
     hero(
         "Dashboard",
-        "Обзор подписчиков, затрат и CPF по всем регионам Novakid. Используйте фильтры, чтобы смотреть отдельный аккаунт или месяц.",
+        "Обзор подписчиков, затрат и CPF по всем регионам Novakid. Используйте фильтры, чтобы смотреть отдельные аккаунты или месяцы.",
         ["Followers", "Spend", "CPF", "Warnings"],
     )
     df = db_df("SELECT * FROM final_results ORDER BY period_start DESC, account, final_followers DESC")
@@ -1364,14 +1384,14 @@ def page_dashboard() -> None:
         st.info("Пока нет данных. Загрузите Meta CSV, затем PR CSV при наличии.")
         return
 
-    selected_accounts, selected_period, only_warnings = shared_results_filters(df)
+    selected_accounts, selected_periods, only_warnings = shared_results_filters(df)
 
     base = df[df["account"].isin(selected_accounts)] if selected_accounts else df.iloc[0:0]
     base = latest_publications_df(base)
     if only_warnings:
         base = base[base["warning"].fillna("") != ""]
 
-    f = apply_date_filter(base, selected_period)
+    f = apply_date_filter(base, selected_periods)
 
     total_followers = int(f["final_followers"].sum()) if not f.empty else 0
     total_meta = int(f["meta_followers"].sum()) if not f.empty else 0
@@ -1394,7 +1414,7 @@ def page_dashboard() -> None:
         c1, c2 = st.columns([1.25, 1])
         with c1:
             monthly = monthly_increment_df(base)
-            monthly = apply_date_filter(monthly, selected_period)
+            monthly = apply_date_filter(monthly, selected_periods)
             fig = px.bar(
                 monthly.sort_values(["month", "account"]),
                 x="month_label",
@@ -1505,10 +1525,10 @@ def filtered_results_ui() -> pd.DataFrame:
     df = db_df("SELECT * FROM final_results ORDER BY period_start DESC, account, final_followers DESC")
     if df.empty:
         return df
-    selected_accounts, selected_period, only_warnings = shared_results_filters(df)
+    selected_accounts, selected_periods, only_warnings = shared_results_filters(df)
     f = df[df["account"].isin(selected_accounts)] if selected_accounts else df.iloc[0:0]
     f = latest_publications_df(f)
-    f = apply_date_filter(f, selected_period)
+    f = apply_date_filter(f, selected_periods)
     if only_warnings:
         f = f[f["warning"].fillna("") != ""]
     return f
